@@ -437,22 +437,28 @@ def score_criterion(
             score = _apply_binary(found, ev, max_marks)
             bands_used = "formula_hint"
         elif formula_hint in ("BAND", "STEP") and _parse_number(ev) is not None:
-            # Can't score without bands — use LLM direct score (single call)
+            # Try to parse bands directly from criteria text (no LLM)
             num = _parse_number(ev)
-            print(f"    [no-bands] No cached bands for BAND criterion — LLM score")
-            score_prompt = (
-                f"Score this value against the RFP criterion.\n"
-                f"CRITERION: {parameter}\n"
-                f"MAX MARKS: {max_marks}\n"
-                f"SCORING RULES: {criterion.get('criteria_text','')[:300]}\n"
-                f"BIDDER VALUE: {ev}\n"
-                f"Return ONLY valid JSON: {{\"score\": <0-{max_marks}>}}"
-            )
-            raw2   = call_llm(score_prompt, label=f"band-score-{parameter[:15]}")
-            parsed = extract_json(raw2) if raw2 else {}
-            score  = float(parsed.get("score", 0)) if parsed else 0.0
-            score  = round(max(0.0, min(score, float(max_marks))), 1)
-            bands_used = "llm_direct"
+            print(f"    [no-bands] No cached bands for {formula_hint} criterion "
+                  f"— parsing from criteria text")
+            try:
+                from core.tq_formula_engine import (
+                    _parse_band_table_strict,
+                    _apply_band_strict,
+                    _apply_step,
+                )
+                criteria_txt = criterion.get("criteria_text", "")
+                if formula_hint == "STEP":
+                    score = _apply_step(criteria_txt, max_marks, num)
+                    if score is not None:
+                        bands_used = "step_parsed"
+                if score is None:
+                    inline_bands = _parse_band_table_strict(criteria_txt, formula_hint)
+                    if inline_bands:
+                        score = _apply_band_strict(inline_bands, num, max_marks, formula_hint)
+                        bands_used = "inline_bands"
+            except Exception:
+                pass
 
     if score is None:
         return _zero(f"Could not score: {parameter} (value={ev})")

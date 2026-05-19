@@ -123,6 +123,27 @@ def extract_marking_scheme(rfp_doc_name: str) -> dict:
         if len(marks_list) < 3:
             schema_warning = f"Only {len(valid)} criteria extracted — likely missed rows, verify manually."
 
+        # Tag each criterion with formula_type and search_keywords
+        try:
+            from core.tq_formula_engine import _detect_formula
+            for c in valid:
+                if not c.get("formula_type"):
+                    c["formula_type"] = _detect_formula(
+                        c.get("parameter", ""), c.get("criteria_text", "")
+                    )
+                if not c.get("search_keywords"):
+                    _ct = f"{c.get('parameter','')} {c.get('criteria_text','')}".lower()
+                    _sw = {"the","and","for","with","from","that","this","have",
+                           "been","each","into","over","will","are","not","its",
+                           "per","any","marks","mark","criteria","criterion",
+                           "maximum","minimum","shall","should","must"}
+                    words = re.findall(r'\b[a-z]{4,}\b', _ct)
+                    c["search_keywords"] = list(dict.fromkeys(
+                        w for w in words if w not in _sw
+                    ))[:12]
+        except Exception:
+            pass
+
         return {
             "criteria":               valid,
             "doc_max":                doc_max,

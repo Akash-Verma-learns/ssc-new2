@@ -241,13 +241,27 @@ def precompute_bands(criteria: list[dict]) -> dict:
             band_str = str(parsed.get("bands", []))[:80]
             print(f"  [bands] {parameter[:50]:50s} → {band_str}")
         else:
-            # Fallback: try to parse bands directly from criteria_text using regex
-            fallback = _regex_parse_bands(criteria_txt, formula_type)
+            # Fallback: comprehensive regex parser from tq_formula_engine
+            fallback = None
+            try:
+                from core.tq_formula_engine import _parse_band_table_strict
+                raw_bands = _parse_band_table_strict(criteria_txt, formula_type)
+                if raw_bands:
+                    fallback = {
+                        "formula_type": formula_type.upper(),
+                        "bands": raw_bands,
+                        "present_score": None,
+                        "absent_score": 0,
+                        "notes": "tq_formula_engine-regex",
+                    }
+            except Exception:
+                fallback = _regex_parse_bands(criteria_txt, formula_type)
             if fallback:
                 bands[parameter] = fallback
-                print(f"  [bands] {parameter[:50]:50s} → (regex fallback) {fallback['bands'][:2]}")
+                print(f"  [bands] {parameter[:50]:50s} → (regex fallback) "
+                      f"{str(fallback.get('bands', []))[:60]}")
             else:
-                print(f"  [bands] {parameter[:50]:50s} → FAILED (will use LLM at scoring time)")
+                print(f"  [bands] {parameter[:50]:50s} → FAILED (will parse at scoring time)")
 
     return bands
 

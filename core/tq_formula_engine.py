@@ -249,3 +249,232 @@ def apply_binary(found: bool, max_marks: int, label: str = "") -> tuple[float, s
 
 def clamp(score: float, max_marks: int) -> float:
     return round(max(0.0, min(float(score), float(max_marks))), 1)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Strict band parser — used by tq_compliance_parser._apply_rfp_formula
+# Handles ALL common Indian-RFP scoring patterns.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _parse_band_table_strict(
+    criteria_text: str,
+    formula_type: str = "BAND",
+) -> list:
+    """
+    Parse scoring bands from RFP criteria text.
+
+    Handles:
+      "100-200 Crs: 5 marks"          → {min:100, max:200, score:5}
+      "Up to 100 Cr = 5 marks"        → {min:0,   max:100, score:5}
+      "Upto 500 Crs = 10 marks"       → {min:0,   max:500, score:10}
+      "Between 100 and 200 Cr: 10 marks" → {min:100, max:200, score:10}
+      "More than 4 projects: 10 marks" → {min:4,  max:None, score:10}
+      "Above 300 Crs: 15 marks"       → {min:300, max:None, score:15}
+      "≥ 50 Cr = 5 marks"             → {min:50,  max:None, score:5}
+      "N+: S marks"                    → {min:N,  max:None, score:S}
+      "> 200 Crs: 10 marks"           → {min:200, max:None, score:10}
+
+    Returns sorted list of band dicts, or [] if nothing parseable.
+    """
+    ct = criteria_text or ""
+
+    def _n(s: str) -> float:
+        return float(str(s).replace(",", ""))
+
+    bands: list[dict] = []
+
+    # Trailing "marks?" is optional so the parser works when RFP omits the word
+    _UNIT = r'(?:cr[ores]*|lakh|years?|projects?|assignments?|persons?|professionals?|employees?)?'
+    _SCORE = r'(\d+(?:\.\d+)?)\s*(?:marks?)?'
+    _SEP   = r'\s*[:\-–=]\s*'
+
+    # 1. "Up to / Upto / ≤ / <= X [unit]: N [marks]"
+    for m in re.finditer(
+        rf'(?:up\s*to|upto|≤|<=)\s*(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}\s*{_SEP}{_SCORE}',
+        ct, re.I,
+    ):
+        sc = float(m.group(2))
+        if sc > 0:
+            bands.append({"min": 0.0, "max": _n(m.group(1)), "score": sc})
+
+    # 2. "X to Y / X - Y [unit]: N [marks]"
+    for m in re.finditer(
+        rf'(\d[\d,]*(?:\.\d+)?)\s*(?:to|-|–)\s*(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}\s*{_SEP}{_SCORE}',
+        ct, re.I,
+    ):
+        lo = _n(m.group(1))
+        hi = _n(m.group(2))
+        sc = float(m.group(3))
+        if lo < hi and 0 < sc:
+            bands.append({"min": lo, "max": hi, "score": sc})
+
+    # 3. "Between X and Y [unit]: N [marks]"
+    for m in re.finditer(
+        rf'between\s+(\d[\d,]*(?:\.\d+)?)\s+and\s+(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}\s*{_SEP}{_SCORE}',
+        ct, re.I,
+    ):
+        lo = _n(m.group(1))
+        hi = _n(m.group(2))
+        sc = float(m.group(3))
+        if 0 < sc:
+            bands.append({"min": lo, "max": hi, "score": sc})
+
+    # 4. "More than / Above / > / ≥ / >= X [unit]: N [marks]"
+    for m in re.finditer(
+        rf'(?:more\s+than|above|over|>\s*|greater\s+than|≥|>=|at\s+least|minimum\s+of?)\s*'
+        rf'(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}\s*{_SEP}{_SCORE}',
+        ct, re.I,
+    ):
+        lo = _n(m.group(1))
+        sc = float(m.group(2))
+        if sc > 0:
+            bands.append({"min": lo, "max": None, "score": sc})
+
+    # 5. "N+ [unit]: S [marks]"
+    for m in re.finditer(
+        rf'(\d[\d,]*(?:\.\d+)?)\s*\+\s*{_UNIT}\s*{_SEP}{_SCORE}',
+        ct, re.I,
+    ):
+        lo = _n(m.group(1))
+        sc = float(m.group(2))
+        if sc > 0 and not any(
+            abs(b["min"] - lo) < 0.1 and b["max"] is None for b in bands
+        ):
+            bands.append({"min": lo, "max": None, "score": sc})
+
+    # 6. Simple "N [unit] = S [marks]" without range
+    if not bands:
+        for m in re.finditer(
+            rf'(\d[\d,]*(?:\.\d+)?)\s*{_UNIT}\s*[=:]\s*{_SCORE}',
+            ct, re.I,
+        ):
+            lo = _n(m.group(1))
+            sc = float(m.group(2))
+            if 0 < sc <= 100:
+                bands.append({"min": lo, "max": None, "score": sc})
+
+    # Deduplicate by (min, max) keeping highest score for duplicates
+    seen: dict = {}
+    for b in bands:
+        key = (b["min"], b["max"])
+        if key not in seen or b["score"] > seen[key]["score"]:
+            seen[key] = b
+
+    result = sorted(seen.values(), key=lambda b: float(b["min"]))
+    return result
+
+
+def _apply_band_strict(
+    bands: list,
+    value: float,
+    max_marks: int,
+    formula_type: str = "BAND",
+) -> Optional[float]:
+    """
+    Apply band scoring deterministically.
+
+    Boundary convention:
+      - Closed bands [lo, hi): lo <= value < hi
+      - Open-ended top band (max=None): value >= lo
+      - Walk ALL bands ascending; LAST match wins
+        (so "more than 300" beats "up to 300" when value == 301)
+
+    Returns score clamped to max_marks, or None if no bands supplied.
+    """
+    if not bands:
+        return None
+
+    matched: Optional[float] = None
+    for band in sorted(bands, key=lambda b: float(b.get("min") or 0)):
+        lo     = float(band.get("min") or 0)
+        hi_raw = band.get("max")
+        hi     = float(hi_raw) if hi_raw is not None else float("inf")
+        sc     = float(band.get("score", 0))
+
+        if hi_raw is None:
+            if value >= lo:
+                matched = sc
+        else:
+            if lo <= value < hi:
+                matched = sc
+
+    if matched is None:
+        # value is below the first band minimum → 0 marks
+        sorted_bands = sorted(bands, key=lambda b: float(b.get("min") or 0))
+        if value >= float(sorted_bands[-1].get("min") or 0):
+            # value exceeds all defined thresholds → award the top band score
+            return round(min(float(sorted_bands[-1].get("score", 0)), float(max_marks)), 1)
+        return 0.0
+
+    return round(min(matched, float(max_marks)), 1)
+
+
+def _apply_step(
+    criteria_text: str,
+    max_marks: int,
+    value: float,
+) -> Optional[float]:
+    """
+    Apply STEP formula: base marks + per-additional-unit increment.
+    Returns score or None if the step pattern cannot be parsed.
+
+    Handles:
+      "Turnover ≥ 50 Cr = 5 marks; for every additional 10 Cr = 1 mark"
+      "100 Cr = 5 marks; above 100 Cr, 1 mark per 20 Cr additional"
+    """
+    ct = criteria_text or ""
+
+    base_m = re.search(
+        r'(\d+(?:\.\d+)?)\s*cr[ores]*\s*[=:\-–]\s*(\d+(?:\.\d+)?)\s*marks?',
+        ct, re.I,
+    )
+    step_m = re.search(
+        r'(?:every|each|per)\s+additional\s+(\d+(?:\.\d+)?)\s*cr[ores]*'
+        r'[\s\W]+(\d+(?:\.\d+)?)\s*marks?',
+        ct, re.I,
+    )
+
+    if not (base_m and step_m):
+        return None
+
+    try:
+        base_thresh = float(base_m.group(1))
+        base_score  = float(base_m.group(2))
+        step_size   = float(step_m.group(1))
+        step_sc     = float(step_m.group(2))
+        if step_size <= 0:
+            return None
+        if value < base_thresh:
+            return 0.0
+        steps = int((value - base_thresh) / step_size)
+        score = base_score + steps * step_sc
+        return round(min(score, float(max_marks)), 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _detect_formula(parameter: str, criteria_text: str) -> str:
+    """
+    Detect formula type from criterion name + criteria text.
+    Thin wrapper around tq_extractor_v20.detect_formula_type so callers
+    that already imported tq_formula_engine don't need another import.
+    """
+    try:
+        from core.tq_extractor_v20 import detect_formula_type
+        return detect_formula_type(parameter, criteria_text)
+    except ImportError:
+        pass
+
+    ct = (criteria_text or "").lower()
+    p  = (parameter or "").lower()
+
+    if re.search(r'\d+\s*marks?\s+(?:per|for\s+(?:each|every|01))\s+'
+                 r'(?:project|assignment)', ct):
+        return "PER_UNIT"
+    if re.search(r'(?:per|for\s+every)\s+additional', ct):
+        return "STEP"
+    if re.search(r'(?:registered|certified|iso|methodology|work\s+plan)', ct):
+        return "BINARY"
+    if re.search(r'(?:team\s+leader|expert|specialist|key\s+personnel)', p):
+        return "QUAL"
+    return "BAND"

@@ -1084,33 +1084,37 @@ def _apply_rfp_formula(formula, value_str, criteria_text, max_marks, criterion, 
         return 0.0, "BINARY: no evidence → 0"
 
     if formula in ("BAND", "BAND_CR", "BAND_PROJECTS", "BAND_HEADCOUNT", "BAND_YEARS", "STEP"):
-        try:
-            from core.tq_extractor import _parse_band_table_strict, _apply_band_strict, _apply_step
-            bands = _parse_band_table_strict(criteria_text, formula)
-            if bands:
-                score = _apply_band_strict(bands, num, max_marks, formula)
-                if score is not None:
-                    return score, f"{formula}: {num} → {score}/{max_marks}"
-            if formula == "STEP":
-                score = _apply_step(criteria_text, max_marks, num)
-                if score is not None:
-                    return score, f"STEP: {num} → {score}/{max_marks}"
-        except Exception:
-            pass
+        from core.tq_formula_engine import (
+            _parse_band_table_strict,
+            _apply_band_strict,
+            _apply_step,
+        )
 
+        # Try STEP first (handles "per additional X Cr" patterns)
+        if formula == "STEP":
+            score = _apply_step(criteria_text, max_marks, num)
+            if score is not None:
+                return score, f"STEP: {num} → {score}/{max_marks}"
+
+        # Parse bands from criteria text
+        bands = _parse_band_table_strict(criteria_text, formula)
+        if bands:
+            score = _apply_band_strict(bands, num, max_marks, formula)
+            if score is not None:
+                return score, f"{formula}: {num} → {score}/{max_marks}"
+
+        # Fall back to pre-cached bands from RFP cache
         if cached_bands:
             band_list = (cached_bands.get(criterion.get("parameter", ""), {})
                          .get("bands", []))
             if band_list:
-                for band in sorted(band_list, key=lambda b: float(b.get("min") or 0)):
-                    lo = float(band.get("min") or 0)
-                    hi_raw = band.get("max")
-                    hi = float(hi_raw) if hi_raw is not None else float("inf")
-                    if lo <= num <= hi:
-                        score = round(min(float(band.get("score") or 0), float(max_marks)), 1)
-                        return score, f"Cached bands: {num} in [{lo},{hi}] → {score}"
+                score = _apply_band_strict(band_list, num, max_marks, formula)
+                if score is not None:
+                    return score, f"Cached bands: {num} → {score}/{max_marks}"
 
-        return round(min(num, float(max_marks)), 1), f"Fallback: {num}"
+        # Last resort: if we have at least one band, apply the open-ended rule
+        # (value >= highest threshold → highest score)
+        return 0.0, f"No bands resolved for {formula} criterion (value={num})"
 
     if formula == "PER_UNIT":
         rate_m = re.search(r"(\d+(?:\.\d+)?)\s*marks?\s+(?:for|per)\s+(?:each|01|one|per)\s+"

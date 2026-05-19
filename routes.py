@@ -1574,7 +1574,7 @@ def run_tq_evaluation_task(
     - Single final session for persisting all results
     """
     from database import SessionLocal, TQEvaluation, TQScoreItem
-    from core.tq_extractor import run_tq_evaluation
+    from core.tq_compliance_parser import run_tq_evaluation
  
     # ── Mark processing ───────────────────────────────────────────────────────
     db = SessionLocal()
